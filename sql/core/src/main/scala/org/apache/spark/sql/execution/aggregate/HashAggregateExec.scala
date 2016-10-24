@@ -14,6 +14,24 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+/*
+ * Changes for SnappyData data platform.
+ *
+ * Portions Copyright (c) 2016 SnappyData, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
 
 package org.apache.spark.sql.execution.aggregate
 
@@ -40,12 +58,18 @@ case class HashAggregateExec(
     aggregateExpressions: Seq[AggregateExpression],
     aggregateAttributes: Seq[Attribute],
     initialInputBufferOffset: Int,
-    resultExpressions: Seq[NamedExpression],
+    __resultExpressions: Seq[NamedExpression],
     child: SparkPlan)
   extends UnaryExecNode with CodegenSupport {
 
-  private[this] val aggregateBufferAttributes = {
+  @transient lazy val resultExpressions = __resultExpressions
+
+  @transient lazy private[this] val aggregateBufferAttributes = {
     aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
+  }
+
+  @transient lazy private[this] val aggregateBufferAttributesForGroup = {
+    aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributesForGroup)
   }
 
   require(HashAggregateExec.supportsAggregate(aggregateBufferAttributes))
@@ -54,7 +78,7 @@ case class HashAggregateExec(
     child.output ++ aggregateBufferAttributes ++ aggregateAttributes ++
       aggregateExpressions.flatMap(_.aggregateFunction.inputAggBufferAttributes)
 
-  override private[sql] lazy val metrics = Map(
+  override lazy val metrics = Map(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "peakMemory" -> SQLMetrics.createSizeMetric(sparkContext, "peak memory"),
     "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"),
@@ -277,7 +301,7 @@ case class HashAggregateExec(
   private val declFunctions = aggregateExpressions.map(_.aggregateFunction)
     .filter(_.isInstanceOf[DeclarativeAggregate])
     .map(_.asInstanceOf[DeclarativeAggregate])
-  private val bufferSchema = StructType.fromAttributes(aggregateBufferAttributes)
+  private val bufferSchema = StructType.fromAttributes(aggregateBufferAttributesForGroup)
 
   // The name for Vectorized HashMap
   private var vectorizedHashMapTerm: String = _
@@ -292,7 +316,7 @@ case class HashAggregateExec(
    */
   def createHashMap(): UnsafeFixedWidthAggregationMap = {
     // create initialized aggregate buffer
-    val initExpr = declFunctions.flatMap(f => f.initialValues)
+    val initExpr = declFunctions.flatMap(_.initialValuesForGroup)
     val initialBuffer = UnsafeProjection.create(initExpr)(EmptyRow)
 
     // create hashMap
@@ -348,7 +372,7 @@ case class HashAggregateExec(
       val mergeExpr = declFunctions.flatMap(_.mergeExpressions)
       val mergeProjection = newMutableProjection(
         mergeExpr,
-        aggregateBufferAttributes ++ declFunctions.flatMap(_.inputAggBufferAttributes),
+        aggregateBufferAttributesForGroup ++ declFunctions.flatMap(_.inputAggBufferAttributes),
         subexpressionEliminationEnabled)
       val joinedRow = new JoinedRow()
 
@@ -413,14 +437,14 @@ case class HashAggregateExec(
       }
       val evaluateKeyVars = evaluateVariables(keyVars)
       ctx.INPUT_ROW = bufferTerm
-      val bufferVars = aggregateBufferAttributes.zipWithIndex.map { case (e, i) =>
+      val bufferVars = aggregateBufferAttributesForGroup.zipWithIndex.map { case (e, i) =>
         BoundReference(i, e.dataType, e.nullable).genCode(ctx)
       }
       val evaluateBufferVars = evaluateVariables(bufferVars)
       // evaluate the aggregation result
       ctx.currentVars = bufferVars
       val aggResults = declFunctions.map(_.evaluateExpression).map { e =>
-        BindReferences.bindReference(e, aggregateBufferAttributes).genCode(ctx)
+        BindReferences.bindReference(e, aggregateBufferAttributesForGroup).genCode(ctx)
       }
       val evaluateAggResults = evaluateVariables(aggResults)
       // generate the final result
@@ -603,8 +627,6 @@ case class HashAggregateExec(
 
     // create grouping key
     ctx.currentVars = input
-    // make sure that the generated code will not be splitted as multiple functions
-    ctx.INPUT_ROW = null
     val unsafeRowKeyCode = GenerateUnsafeProjection.createCode(
       ctx, groupingExpressions.map(e => BindReferences.bindReference[Expression](e, child.output)))
     val vectorizedRowKeys = ctx.generateExpressions(
@@ -628,8 +650,8 @@ case class HashAggregateExec(
     ctx.currentVars = input
     val hashEval = BindReferences.bindReference(hashExpr, child.output).genCode(ctx)
 
-    val inputAttr = aggregateBufferAttributes ++ child.output
-    ctx.currentVars = new Array[ExprCode](aggregateBufferAttributes.length) ++ input
+    val inputAttr = aggregateBufferAttributesForGroup ++ child.output
+    ctx.currentVars = new Array[ExprCode](aggregateBufferAttributesForGroup.length) ++ input
 
     val (checkFallbackForGeneratedHashMap, checkFallbackForBytesToBytesMap, resetCounter,
     incCounter) = if (testFallbackStartsAt.isDefined) {
