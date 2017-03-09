@@ -311,6 +311,8 @@ case class WholeStageCodegenExec(child: SparkPlan) extends UnaryExecNode with Co
   def doCodeGen(): (CodegenContext, CodeAndComment) = {
     val ctx = new CodegenContext
     val code = child.asInstanceOf[CodegenSupport].produce(ctx, this)
+    //TODO: [Sachin] The changes done in processNext for MVCC are temporary and should be removed
+    // after proper fix
     val source = s"""
       public Object generate(Object[] references) {
         return new GeneratedIterator(references);
@@ -334,22 +336,39 @@ case class WholeStageCodegenExec(child: SparkPlan) extends UnaryExecNode with Co
         ${ctx.declareAddedFunctions()}
 
         protected void processNext() throws java.io.IOException {
-          ${code.trim}
+
+          try {
+
+            ${code.trim}
+          } finally {
+                    |com.gemstone.gemfire.internal.cache.TXStateInterface tx = (com.gemstone.gemfire.internal.cache.TXStateInterface)com.gemstone
+                    |.gemfire
+                    |        .internal.cache.TXManagerImpl.snapshotTxState.get();
+                    |
+                    if(null!=tx){
+                    |com.gemstone.gemfire.internal.cache.GemFireCacheImpl.getInstance()
+                    |.getCacheTransactionManager().masqueradeAs(tx);
+                    |com.gemstone.gemfire.internal.cache.GemFireCacheImpl.getInstance()
+                    |.getCacheTransactionManager().commit();
+                    |}
+          }
         }
       }
-      """.trim
+      """.stripMargin.trim
 
     // try to compile, helpful for debug
     val cleanedSource = CodeFormatter.stripOverlappingComments(
       new CodeAndComment(CodeFormatter.stripExtraNewLines(source), ctx.getPlaceHolderToComments()))
 
-    logDebug(s"\n${CodeFormatter.format(cleanedSource)}")
+    logInfo(s"\n${CodeFormatter.format(cleanedSource)}")
+
     (ctx, cleanedSource)
   }
 
   override def doExecute(): RDD[InternalRow] = {
     val (ctx, cleanedSource) = doCodeGen()
     // try to compile and fallback if it failed
+    println(s"\n${CodeFormatter.format(cleanedSource)}")
     try {
       CodeGenerator.compile(cleanedSource)
     } catch {
